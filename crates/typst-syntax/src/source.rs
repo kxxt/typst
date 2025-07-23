@@ -9,8 +9,8 @@ use typst_utils::LazyHash;
 use crate::lines::Lines;
 use crate::reparser::reparse;
 use crate::{
-    FileId, LinkedNode, RootedPath, Span, SpanNumber, SubRange, SyntaxNode, VirtualPath,
-    VirtualRoot, parse,
+    Edits, FileId, LinkedNode, RootedPath, Span, SpanNumber, SubRange, SyntaxNode,
+    VirtualPath, VirtualRoot, parse,
 };
 
 /// A Typst source file containing the full source text, a mapping from byte
@@ -89,10 +89,15 @@ impl Source {
             return 0..0;
         };
 
-        let old = self.text();
-        let replace = prefix..old.len() - suffix;
+        let (replace, replaced_length) = {
+            let old = self.text();
+            let replace = prefix..old.len() - suffix;
+            let replaced_length =
+                old[replace.clone()].chars().map(char::len_utf16).sum::<usize>();
+            (replace, replaced_length)
+        };
         let with = &new[prefix..new.len() - suffix];
-        self.edit(replace, with)
+        self.edit_with_edits(replace, replaced_length, with, &mut None)
     }
 
     /// Edit the source file by replacing the given range.
@@ -102,13 +107,32 @@ impl Source {
     /// The method panics if the `replace` range is out of bounds.
     #[track_caller]
     pub fn edit(&mut self, replace: Range<usize>, with: &str) -> Range<usize> {
+        let replaced_length =
+            self.text()[replace.clone()].chars().map(char::len_utf16).sum::<usize>();
+        self.edit_with_edits(replace, replaced_length, with, &mut None)
+    }
+
+    /// Edit the source file by replacing the given range while tracking the
+    /// incremental edits made to the syntax tree for the wasm binding.
+    ///
+    /// Returns the range in the new source that was ultimately reparsed.
+    ///
+    /// The method panics if the `replace` range is out of bounds.
+    #[track_caller]
+    pub(crate) fn edit_with_edits(
+        &mut self,
+        replace: Range<usize>,
+        replaced_length: usize,
+        with: &str,
+        edits: &mut Option<Edits>,
+    ) -> Range<usize> {
         let inner = &mut **Arc::make_mut(&mut self.0);
 
         // Update the text and lines.
         inner.lines.edit(replace.clone(), with);
 
         // Incrementally reparse the replaced range.
-        reparse(&mut inner.root, inner.lines.text(), replace, with.len())
+        reparse(&mut inner.root, inner.lines.text(), replace, with, replaced_length, edits)
     }
 
     /// Find the node with the given span.

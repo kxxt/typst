@@ -5,12 +5,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
+use serde::Serialize;
 use typst_utils::debug;
 
 use crate::kind::ModeAfter;
 use crate::{
-    DiagSpan, FileId, RangeMapper, Span, SpanKind, SpanNumber, Spanned, SubRange,
-    SyntaxKind, SyntaxMode,
+    ChildrenSplice, DiagSpan, Edit, Edits, FileId, RangeMapper, Span, SpanKind, SpanNumber,
+    Spanned, SubRange, SyntaxKind, SyntaxMode, UpdateParent,
 };
 
 /// A node in the untyped syntax tree.
@@ -233,6 +234,15 @@ impl SyntaxNode {
             NodeRef::Leaf(text) => text.len(),
             NodeRef::Inner(inner) => inner.len,
             NodeRef::Error(err) => err.text.len(),
+        }
+    }
+
+    /// The UTF-16 length of the node in the source text.
+    pub fn length(&self) -> usize {
+        match self.node_ref() {
+            NodeRef::Leaf(text) => text.chars().map(char::len_utf16).sum(),
+            NodeRef::Inner(inner) => inner.length,
+            NodeRef::Error(err) => err.text.chars().map(char::len_utf16).sum(),
         }
     }
 
@@ -560,9 +570,11 @@ impl SyntaxNode {
         &mut self,
         range: Range<usize>,
         replacement: Vec<SyntaxNode>,
+        prefix: &[usize],
+        edits: &mut Option<Edits>,
     ) -> NumberingResult {
         if let Some((inner, span)) = self.inner_and_span_mut() {
-            inner.replace_children(span, range, replacement)
+            inner.replace_children(span, range, replacement, prefix, edits)
         } else {
             Ok(())
         }
@@ -573,11 +585,24 @@ impl SyntaxNode {
         &mut self,
         prev_len: usize,
         new_len: usize,
+        prev_length: usize,
+        new_length: usize,
         prev_descendants: usize,
         new_descendants: usize,
+        prefix: &[usize],
+        edits: &mut Option<Edits>,
     ) {
         if let Some((inner, _)) = self.inner_and_span_mut() {
-            inner.update_parent(prev_len, new_len, prev_descendants, new_descendants)
+            inner.update_parent(
+                prev_len,
+                new_len,
+                prev_length,
+                new_length,
+                prev_descendants,
+                new_descendants,
+                prefix,
+                edits,
+            )
         }
     }
 
@@ -593,6 +618,30 @@ impl SyntaxNode {
 impl Debug for SyntaxNode {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.data.fmt(f)
+    }
+}
+
+impl Serialize for SyntaxNode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("SyntaxNode", 4)?;
+        state.serialize_field("kind", &self.kind())?;
+        state.serialize_field("length", &self.length())?;
+        match self.node_ref() {
+            NodeRef::Leaf(_) | NodeRef::Error(_) => {
+                state.serialize_field("children", &[] as &[SyntaxNode])?;
+                state.serialize_field("positions", &[] as &[usize])?;
+            }
+            NodeRef::Inner(inner) => {
+                state.serialize_field("children", &inner.children)?;
+                state.serialize_field("positions", &inner.positions)?;
+            }
+        }
+        state.end()
     }
 }
 
@@ -618,6 +667,8 @@ impl Default for SyntaxNode {
 struct InnerNode {
     /// The byte length of the node in the source.
     len: usize,
+    /// The UTF-16 length of the node in the source.
+    length: usize,
     /// The number of nodes in the whole subtree, including this node.
     descendants: usize,
     /// Whether this node or any of its children contain an error/warning
@@ -627,22 +678,36 @@ struct InnerNode {
     upper: u64,
     /// This node's children, losslessly make up this node.
     children: Vec<SyntaxNode>,
+    /// The UTF-16 offsets of this node's children.
+    positions: Vec<usize>,
 }
 
 impl InnerNode {
     /// Create a new inner node with the given children.
     fn new(children: Vec<SyntaxNode>) -> Self {
         let mut len = 0;
+        let mut length = 0;
         let mut descendants = 1;
         let mut diagnosis = Diagnosis::default();
+        let mut positions = vec![];
 
         for child in &children {
+            positions.push(length);
             len += child.len();
+            length += child.length();
             descendants += child.descendants();
             diagnosis = diagnosis.or(child.diagnosis());
         }
 
-        Self { len, descendants, diagnosis, upper: 0, children }
+        Self {
+            len,
+            length,
+            descendants,
+            diagnosis,
+            upper: 0,
+            children,
+            positions,
+        }
     }
 
     /// Assign span numbers `within` an interval to this node's subtree or just
@@ -717,6 +782,8 @@ impl InnerNode {
         span: &mut Span,
         mut range: Range<usize>,
         replacement: Vec<SyntaxNode>,
+        prefix: &[usize],
+        edits: &mut Option<Edits>,
     ) -> NumberingResult {
         let Some(id) = span.id() else { return Err(Unnumberable) };
         let mut replacement_range = 0..replacement.len();
@@ -773,7 +840,16 @@ impl InnerNode {
         // Perform the replacement.
         self.children
             .splice(range.clone(), replacement_vec.drain(replacement_range.clone()));
+        let orig_range = range.clone();
         range.end = range.start + replacement_range.len();
+        if let Some(edits) = edits {
+            edits.push(Edit::ChildrenSplice(ChildrenSplice {
+                prefix: prefix.to_vec(),
+                from: orig_range.start,
+                to: orig_range.end,
+                replacement: self.children[range.clone()].to_vec(),
+            }));
+        }
 
         // Renumber the new children. Retries until it works, taking
         // exponentially more children into account.
@@ -813,6 +889,9 @@ impl InnerNode {
 
             // If it didn't even work with all children, we give up.
             if left == max_left && right == max_right {
+                if let Some(edits) = edits {
+                    edits.pop();
+                }
                 return Err(Unnumberable);
             }
 
@@ -827,12 +906,23 @@ impl InnerNode {
         &mut self,
         prev_len: usize,
         new_len: usize,
+        prev_length: usize,
+        new_length: usize,
         prev_descendants: usize,
         new_descendants: usize,
+        prefix: &[usize],
+        edits: &mut Option<Edits>,
     ) {
         self.len = self.len + new_len - prev_len;
         self.descendants = self.descendants + new_descendants - prev_descendants;
         self.diagnosis = Diagnosis::any(&self.children);
+        if let Some(edits) = edits {
+            edits.push(Edit::UpdateParent(UpdateParent {
+                prefix: prefix.to_vec(),
+                prev: prev_length,
+                new: new_length,
+            }))
+        }
     }
 
     /// Format the inner node with its `SyntaxKind` for debugging.

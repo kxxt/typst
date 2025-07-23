@@ -1,14 +1,14 @@
 use std::ops::Range;
 
 use crate::{
-    Span, SyntaxKind, SyntaxNode, is_newline, parse, reparse_block, reparse_markup,
+    Edits, Span, SyntaxKind, SyntaxNode, is_newline, parse, reparse_block, reparse_markup,
 };
 
 /// Refresh the given syntax node with as little parsing as possible.
 ///
-/// Takes the new text, the range in the old text that was replaced and the
-/// length of the replacement and returns the range in the new text that was
-/// ultimately reparsed.
+/// Takes the new text, the range in the old text that was replaced, the
+/// replacement and the length of the replaced range in UTF-16 code units, and
+/// returns the range in the new text that was ultimately reparsed.
 ///
 /// The high-level API for this function is
 /// [`Source::edit`](crate::Source::edit).
@@ -16,16 +16,22 @@ pub fn reparse(
     root: &mut SyntaxNode,
     text: &str,
     replaced: Range<usize>,
-    replacement_len: usize,
+    replacement: &str,
+    replaced_length: usize,
+    edits: &mut Option<Edits>,
 ) -> Range<usize> {
-    try_reparse(text, replaced, replacement_len, None, root, 0).unwrap_or_else(|| {
-        let id = root.span().id();
-        *root = parse(text);
-        if let Some(id) = id {
-            root.numberize(id, Span::FULL).unwrap();
-        }
-        0..text.len()
-    })
+    try_reparse(text, replaced, replacement, replaced_length, None, root, 0, edits)
+        .unwrap_or_else(|| {
+            let id = root.span().id();
+            *root = parse(text);
+            if let Some(id) = id {
+                root.numberize(id, Span::FULL).unwrap();
+            }
+            if let Some(edits) = edits {
+                edits.fail_incremental();
+            }
+            0..text.len()
+        })
 }
 
 /// Try to reparse inside the given node, returning the range that was
@@ -55,14 +61,67 @@ pub fn reparse(
 fn try_reparse(
     text: &str,
     replaced: Range<usize>,
-    replacement_len: usize,
+    replacement: &str,
+    replaced_length: usize,
     parent_kind: Option<SyntaxKind>,
     node: &mut SyntaxNode,
     offset: usize,
+    edits: &mut Option<Edits>,
+) -> Option<Range<usize>> {
+    let mut prefix = Vec::new();
+    try_reparse_inner(
+        text,
+        replaced,
+        replacement,
+        replaced_length,
+        parent_kind,
+        node,
+        offset,
+        edits,
+        &mut prefix,
+    )
+}
+
+/// Try to reparse inside the given node, returning the range that was
+/// ultimately reparsed.
+///
+/// We start by doing a depth-first search for the innermost node or nodes which
+/// fully surround the replaced range. This can be a single node that is a
+/// code/content block or one or more nodes that are markup expressions and are
+/// directly inside a markup block or the top-level markup. In either case, we
+/// call the parser and succeed only if the parsed text has balanced delimiters
+/// with the same delimiter nesting level as before. Otherwise, we expand the
+/// set of markup expressions outwards or return upwards until we either get a
+/// parse that does succeed or we parse the entire text.
+///
+/// Note that we currently only reparse markup expressions at the top-level or
+/// directly inside a markup block. E.g. we don't reparse markup expressions
+/// inside lists or headings, etc. In the past we did reparse those, but the
+/// implementation was very buggy due to edge cases surrounding indentation and
+/// newlines, and was eventually removed without much performance impact. It's
+/// still potentially desireable to handle some of those cases (individual list
+/// items can get quite long in practice), but only if the implementation can be
+/// easily reasoned as correct and shows a measured performance improvement.
+///
+/// We also do not currently reparse math in any capacity, but it would not be
+/// too difficult to include equations as another kind of block, or reparse math
+/// expressions similarly to markup expressions.
+fn try_reparse_inner(
+    text: &str,
+    replaced: Range<usize>,
+    replacement: &str,
+    replaced_length: usize,
+    parent_kind: Option<SyntaxKind>,
+    node: &mut SyntaxNode,
+    offset: usize,
+    edits: &mut Option<Edits>,
+    prefix: &mut Vec<usize>,
 ) -> Option<Range<usize>> {
     let (overlap, start_offset) = overlapping_children(node, replaced.clone(), offset)?;
 
     let node_kind = node.kind();
+    let replacement_len = replacement.len();
+    let replacement_utf16_len = replacement.chars().map(char::len_utf16).sum::<usize>();
     let children = node.children_mut();
 
     if let [child] = &mut children[overlap.clone()]
@@ -72,25 +131,41 @@ fn try_reparse(
     {
         // A single child fully surrounds the edit. We either reparse within the
         // child, or reparse the child itself (if the child is a block).
+        prefix.push(overlap.start);
         let prev_len = child.len();
+        let prev_length = child.length();
         let prev_desc = child.descendants();
         let new_len = prev_len + replacement_len - replaced.len();
+        let new_length = prev_length + replacement_utf16_len - replaced_length;
         let new_range = start_offset..start_offset + new_len;
 
         // Recursively descend and try to reparse at a lower level.
-        if let Some(range) = try_reparse(
+        if let Some(range) = try_reparse_inner(
             text,
             replaced.clone(),
-            replacement_len,
+            replacement,
+            replaced_length,
             Some(node_kind),
             child,
             start_offset,
+            edits,
+            prefix,
         ) {
             // A lower level reparse succeeded! Update this node and return the
             // reparsed range.
             assert_eq!(child.len(), new_len);
             let new_desc = child.descendants();
-            node.update_parent(prev_len, new_len, prev_desc, new_desc);
+            node.update_parent(
+                prev_len,
+                new_len,
+                prev_length,
+                new_length,
+                prev_desc,
+                new_desc,
+                prefix,
+                edits,
+            );
+            prefix.pop();
             return Some(range);
         }
 
@@ -101,11 +176,18 @@ fn try_reparse(
         {
             // Reparsing succeeded, but we can still fail if we're out of span
             // numbers to assign to nodes (this is rare).
-            return node
-                .replace_children(overlap, vec![reparsed])
-                .is_ok()
-                .then_some(new_range);
+            let reparsed =
+                node.replace_children(
+                    overlap,
+                    vec![reparsed],
+                    &prefix.split_last().unwrap_or((&0, &[])).1,
+                    edits,
+                );
+            prefix.pop();
+            return reparsed.is_ok().then_some(new_range);
         }
+
+        prefix.pop();
     }
 
     if node_kind == SyntaxKind::Markup
@@ -114,11 +196,13 @@ fn try_reparse(
         expand_and_reparse_markup(
             text,
             replaced,
-            replacement_len,
+            replacement,
             node,
             overlap,
             offset,
             parent_kind.is_none(),
+            edits,
+            prefix,
         )
     } else {
         None
@@ -130,11 +214,13 @@ fn try_reparse(
 fn expand_and_reparse_markup(
     text: &str,
     replaced: Range<usize>,
-    replacement_len: usize,
+    replacement: &str,
     node: &mut SyntaxNode,
     overlap: Range<usize>,
     offset: usize,
     top_level: bool,
+    edits: &mut Option<Edits>,
+    prefix: &mut Vec<usize>,
 ) -> Option<Range<usize>> {
     let children = node.children().as_slice();
 
@@ -184,7 +270,7 @@ fn expand_and_reparse_markup(
 
         // Determine the range in the new text that we want to reparse.
         let shifted = offset + prefix_len;
-        let new_len = prev_len + replacement_len - replaced.len();
+        let new_len = prev_len + replacement.len() - replaced.len();
         let new_range = shifted..shifted + new_len;
         let at_end = end == children.len();
 
@@ -207,7 +293,7 @@ fn expand_and_reparse_markup(
                 // Reparsing succeeded, but we can still fail if we're out of
                 // span numbers to assign to nodes (this is rare).
                 return node
-                    .replace_children(start..end, newborns)
+                    .replace_children(start..end, newborns, prefix, edits)
                     .is_ok()
                     .then_some(new_range);
             }
