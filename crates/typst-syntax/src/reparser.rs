@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use crate::{
-    Span, SyntaxKind, SyntaxNode, is_newline, parse, reparse_block, reparse_markup,
+    Edits, Span, SyntaxKind, SyntaxNode, is_newline, parse, reparse_block, reparse_markup,
 };
 
 /// Refresh the given syntax node with as little parsing as possible.
@@ -16,56 +16,108 @@ pub fn reparse(
     root: &mut SyntaxNode,
     text: &str,
     replaced: Range<usize>,
-    replacement_len: usize,
+    replacement: &str,
+    replaced_length: usize,
+    edits: &mut Option<Edits>,
 ) -> Range<usize> {
-    try_reparse(text, replaced, replacement_len, None, root, 0).unwrap_or_else(|| {
-        let id = root.span().id();
-        *root = parse(text);
-        if let Some(id) = id {
-            root.numberize(id, Span::FULL).unwrap();
-        }
-        0..text.len()
-    })
+    try_reparse(text, replaced, replacement, replaced_length, None, root, 0, edits)
+        .unwrap_or_else(|| {
+            let id = root.span().id();
+            *root = parse(text);
+            if let Some(id) = id {
+                root.numberize(id, Span::FULL).unwrap();
+            }
+            if let Some(edits) = edits {
+                edits.fail_incremental()
+            }
+            0..text.len()
+        })
 }
 
 /// Try to reparse inside the given node.
 fn try_reparse(
     text: &str,
     replaced: Range<usize>,
-    replacement_len: usize,
+    replacement: &str,
+    replaced_length: usize,
     parent_kind: Option<SyntaxKind>,
     node: &mut SyntaxNode,
     offset: usize,
+    edits: &mut Option<Edits>,
+) -> Option<Range<usize>> {
+    let mut prefix = Vec::new();
+    try_reparse_inner(
+        text,
+        replaced,
+        replacement,
+        replaced_length,
+        parent_kind,
+        node,
+        offset,
+        edits,
+        &mut prefix,
+    )
+}
+
+/// Try to reparse inside the given node.
+fn try_reparse_inner(
+    text: &str,
+    replaced: Range<usize>,
+    replacement: &str,
+    replaced_length: usize,
+    parent_kind: Option<SyntaxKind>,
+    node: &mut SyntaxNode,
+    offset: usize,
+    edits: &mut Option<Edits>,
+    prefix: &mut Vec<usize>,
 ) -> Option<Range<usize>> {
     // The range of children which overlap with the edit.
     #[allow(clippy::reversed_empty_ranges)]
     let mut overlap = usize::MAX..0;
     let mut cursor = offset;
     let node_kind = node.kind();
+    let replacement_len = replacement.len();
+    let replacement_length = replacement.chars().map(char::len_utf16).sum::<usize>();
 
     for (i, child) in node.children_mut().iter_mut().enumerate() {
+        prefix.push(i);
         let prev_range = cursor..cursor + child.len();
         let prev_len = child.len();
+        let prev_length = child.length();
         let prev_desc = child.descendants();
 
         // Does the child surround the edit?
         // If so, try to reparse within it or itself.
         if !child.is_leaf() && includes(&prev_range, &replaced) {
             let new_len = prev_len + replacement_len - replaced.len();
+            let new_length = prev_length + replacement_length - replaced_length;
             let new_range = cursor..cursor + new_len;
 
             // Try to reparse within the child.
-            if let Some(range) = try_reparse(
+            if let Some(range) = try_reparse_inner(
                 text,
                 replaced.clone(),
-                replacement_len,
+                replacement,
+                replaced_length,
                 Some(node_kind),
                 child,
                 cursor,
+                edits,
+                prefix,
             ) {
                 assert_eq!(child.len(), new_len);
                 let new_desc = child.descendants();
-                node.update_parent(prev_len, new_len, prev_desc, new_desc);
+                node.update_parent(
+                    prev_len,
+                    new_len,
+                    prev_length,
+                    new_length,
+                    prev_desc,
+                    new_desc,
+                    &prefix,
+                    edits,
+                );
+                prefix.pop();
                 return Some(range);
             }
 
@@ -73,10 +125,17 @@ fn try_reparse(
             if child.kind().is_block()
                 && let Some(newborn) = reparse_block(text, new_range.clone())
             {
-                return node
-                    .replace_children(i..i + 1, vec![newborn])
+                let ret = node
+                    .replace_children(
+                        i..i + 1,
+                        vec![newborn],
+                        &prefix.split_last().unwrap_or((&0, &[])).1,
+                        edits,
+                    )
                     .is_ok()
                     .then_some(new_range);
+                prefix.pop();
+                return ret;
             }
         }
 
@@ -85,6 +144,8 @@ fn try_reparse(
             overlap.start = overlap.start.min(i);
             overlap.end = i + 1;
         }
+
+        prefix.pop();
 
         // Is the child beyond the edit?
         if replaced.end < cursor {
@@ -174,7 +235,7 @@ fn try_reparse(
                 && ((at_end && parent_kind.is_none()) || nesting == prev_nesting_after)
             {
                 return node
-                    .replace_children(start..end, newborns)
+                    .replace_children(start..end, newborns, &prefix, edits)
                     .is_ok()
                     .then_some(new_range);
             }
@@ -246,7 +307,10 @@ mod tests {
     fn test(prev: &str, range: Range<usize>, with: &str, incremental: bool) {
         let mut source = Source::detached(prev);
         let prev = source.root().clone();
-        let range = source.edit(range, with);
+        let text = source.text();
+        let replaced_length =
+            text[range.clone()].chars().map(char::len_utf16).sum::<usize>();
+        let range = source.edit(range, replaced_length, with, &mut None);
         let mut found = source.root().clone();
         let mut expected = parse(source.text());
         found.synthesize(Span::detached());

@@ -4,15 +4,19 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ecow::{EcoString, EcoVec, eco_format, eco_vec};
+use serde::Serialize;
+use wasm_bindgen::prelude::wasm_bindgen;
 
-use crate::{FileId, Span, SyntaxKind};
+use crate::{ChildrenSplice, Edit, Edits, FileId, Span, SyntaxKind, UpdateParent};
 
 /// A node in the untyped syntax tree.
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[wasm_bindgen]
+#[derive(Clone, Eq, PartialEq, Hash, Serialize)]
 pub struct SyntaxNode(Repr);
 
 /// The three internal representations.
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash, Serialize)]
+#[serde(untagged)]
 enum Repr {
     /// A leaf node.
     Leaf(LeafNode),
@@ -49,7 +53,10 @@ impl SyntaxNode {
         Self(Repr::Leaf(LeafNode {
             kind,
             text: EcoString::new(),
+            length: 0,
             span: Span::detached(),
+            children: [],
+            positions: [],
         }))
     }
 
@@ -73,6 +80,14 @@ impl SyntaxNode {
             Repr::Leaf(leaf) => leaf.len(),
             Repr::Inner(inner) => inner.len,
             Repr::Error(node) => node.len(),
+        }
+    }
+
+    pub fn length(&self) -> usize {
+        match &self.0 {
+            Repr::Leaf(leaf) => leaf.length,
+            Repr::Inner(inner) => inner.length,
+            Repr::Error(node) => node.length,
         }
     }
 
@@ -258,9 +273,11 @@ impl SyntaxNode {
         &mut self,
         range: Range<usize>,
         replacement: Vec<SyntaxNode>,
+        prefix: &[usize],
+        edits: &mut Option<Edits>,
     ) -> NumberingResult {
         if let Repr::Inner(inner) = &mut self.0 {
-            Arc::make_mut(inner).replace_children(range, replacement)?;
+            Arc::make_mut(inner).replace_children(range, replacement, prefix, edits)?;
         }
         Ok(())
     }
@@ -270,15 +287,23 @@ impl SyntaxNode {
         &mut self,
         prev_len: usize,
         new_len: usize,
+        prev_length: usize,
+        new_length: usize,
         prev_descendants: usize,
         new_descendants: usize,
+        prefix: &[usize],
+        edits: &mut Option<Edits>,
     ) {
         if let Repr::Inner(inner) = &mut self.0 {
             Arc::make_mut(inner).update_parent(
                 prev_len,
                 new_len,
+                prev_length,
+                new_length,
                 prev_descendants,
                 new_descendants,
+                prefix,
+                edits,
             );
         }
     }
@@ -310,15 +335,21 @@ impl Default for SyntaxNode {
 }
 
 /// A leaf node in the untyped syntax tree.
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash, Serialize)]
 struct LeafNode {
     /// What kind of node this is (each kind would have its own struct in a
     /// strongly typed AST).
     kind: SyntaxKind,
     /// The source text of the node.
+    #[serde(skip)]
     text: EcoString,
+    /// The number of chars in the text
+    length: usize,
     /// The node's span.
+    #[serde(skip)]
     span: Span,
+    children: [(); 0],
+    positions: [(); 0],
 }
 
 impl LeafNode {
@@ -326,7 +357,15 @@ impl LeafNode {
     #[track_caller]
     fn new(kind: SyntaxKind, text: impl Into<EcoString>) -> Self {
         debug_assert!(!kind.is_error());
-        Self { kind, text: text.into(), span: Span::detached() }
+        let text = text.into();
+        Self {
+            kind,
+            length: text.chars().map(char::len_utf16).sum::<usize>(),
+            text,
+            span: Span::detached(),
+            children: [(); 0],
+            positions: [(); 0],
+        }
     }
 
     /// The byte length of the node in the source text.
@@ -342,28 +381,35 @@ impl LeafNode {
 
 impl Debug for LeafNode {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{:?}: {:?}", self.kind, self.text)
+        write!(f, "{:?}: {} {:?}", self.kind, self.length, self.text)
     }
 }
 
 /// An inner node in the untyped syntax tree.
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash, Serialize)]
 struct InnerNode {
     /// What kind of node this is (each kind would have its own struct in a
     /// strongly typed AST).
     kind: SyntaxKind,
+    /// The number of UTF-16 code units.
+    length: usize,
     /// The byte length of the node in the source.
+    #[serde(skip)]
     len: usize,
     /// The node's span.
+    #[serde(skip)]
     span: Span,
     /// The number of nodes in the whole subtree, including this node.
+    #[serde(skip)]
     descendants: usize,
     /// Whether this node or any of its children are erroneous.
     erroneous: bool,
     /// The upper bound of this node's numbering range.
+    #[serde(skip)]
     upper: u64,
     /// This node's children, losslessly make up this node.
     children: Vec<SyntaxNode>,
+    positions: Vec<usize>,
 }
 
 impl InnerNode {
@@ -373,11 +419,15 @@ impl InnerNode {
         debug_assert!(!kind.is_error());
 
         let mut len = 0;
+        let mut length = 0;
         let mut descendants = 1;
         let mut erroneous = false;
+        let mut positions = vec![];
 
         for child in &children {
+            positions.push(length);
             len += child.len();
+            length += child.length();
             descendants += child.descendants();
             erroneous |= child.erroneous();
         }
@@ -385,11 +435,13 @@ impl InnerNode {
         Self {
             kind,
             len,
+            length,
             span: Span::detached(),
             descendants,
             erroneous,
             upper: 0,
             children,
+            positions,
         }
     }
 
@@ -473,6 +525,8 @@ impl InnerNode {
         &mut self,
         mut range: Range<usize>,
         replacement: Vec<SyntaxNode>,
+        prefix: &[usize],
+        edits: &mut Option<Edits>,
     ) -> NumberingResult {
         let Some(id) = self.span.id() else { return Err(Unnumberable) };
         let mut replacement_range = 0..replacement.len();
@@ -520,9 +574,18 @@ impl InnerNode {
                 || self.children[range.end..].iter().any(SyntaxNode::erroneous));
 
         // Perform the replacement.
-        self.children
-            .splice(range.clone(), replacement_vec.drain(replacement_range.clone()));
+        let replacement = replacement_vec.drain(replacement_range.clone());
+        self.children.splice(range.clone(), replacement);
+        let orig_range = range.clone();
         range.end = range.start + replacement_range.len();
+        if let Some(edits) = edits {
+            edits.push(Edit::ChildrenSplice(ChildrenSplice {
+                prefix: prefix.to_vec(),
+                from: orig_range.start,
+                to: orig_range.end,
+                replacement: self.children[range.clone()].to_vec(),
+            }));
+        }
 
         // Renumber the new children. Retries until it works, taking
         // exponentially more children into account.
@@ -562,6 +625,9 @@ impl InnerNode {
 
             // If it didn't even work with all children, we give up.
             if left == max_left && right == max_right {
+                if let Some(edits) = edits {
+                    edits.pop();
+                }
                 return Err(Unnumberable);
             }
 
@@ -576,12 +642,23 @@ impl InnerNode {
         &mut self,
         prev_len: usize,
         new_len: usize,
+        prev_length: usize,
+        new_length: usize,
         prev_descendants: usize,
         new_descendants: usize,
+        prefix: &[usize],
+        edits: &mut Option<Edits>,
     ) {
         self.len = self.len + new_len - prev_len;
         self.descendants = self.descendants + new_descendants - prev_descendants;
         self.erroneous = self.children.iter().any(SyntaxNode::erroneous);
+        if let Some(edits) = edits {
+            edits.push(Edit::UpdateParent(UpdateParent {
+                prefix: prefix.to_vec(),
+                prev: prev_length,
+                new: new_length,
+            }))
+        }
     }
 }
 
@@ -597,18 +674,32 @@ impl Debug for InnerNode {
 }
 
 /// An error node in the untyped syntax tree.
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash, Serialize)]
 struct ErrorNode {
+    kind: SyntaxKind,
     /// The source text of the node.
+    #[serde(skip)]
     text: EcoString,
+    /// Number of utf-16 code units
+    length: usize,
     /// The syntax error.
     error: SyntaxError,
+    children: [(); 0],
+    positions: [(); 0],
 }
 
 impl ErrorNode {
     /// Create new error node.
     fn new(error: SyntaxError, text: impl Into<EcoString>) -> Self {
-        Self { text: text.into(), error }
+        let text = text.into();
+        Self {
+            length: text.chars().map(char::len_utf16).sum::<usize>(),
+            text,
+            error,
+            kind: SyntaxKind::Error,
+            children: [],
+            positions: [],
+        }
     }
 
     /// The byte length of the node in the source text.
@@ -634,9 +725,10 @@ impl Debug for ErrorNode {
 }
 
 /// A syntactical error.
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize)]
 pub struct SyntaxError {
     /// The node's span.
+    #[serde(skip)]
     pub span: Span,
     /// The error message.
     pub message: EcoString,

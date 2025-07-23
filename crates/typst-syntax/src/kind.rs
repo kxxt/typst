@@ -1,11 +1,14 @@
+use serde_repr::Serialize_repr;
+use strum::{EnumIter, IntoStaticStr};
+
 /// A syntactical building block of a Typst file.
 ///
 /// Can be created by the lexer or by the parser.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Serialize_repr, EnumIter, IntoStaticStr)]
 #[repr(u8)]
 pub enum SyntaxKind {
     /// The end of token stream.
-    End,
+    End = 1,
     /// An invalid sequence of characters.
     Error,
 
