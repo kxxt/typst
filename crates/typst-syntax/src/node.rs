@@ -812,9 +812,36 @@ impl InnerNode {
         let replacement = &replacement_vec[replacement_range.clone()];
         let superseded = &self.children[range.clone()];
 
+        // Keep the UTF-16 offsets used by JavaScript consumers in sync with
+        // the byte offsets maintained by the incremental parser.
+        let old_length = self.length;
+        let replacement_length =
+            replacement.iter().map(SyntaxNode::length).sum::<usize>();
+        let superseded_length = superseded.iter().map(SyntaxNode::length).sum::<usize>();
+        let replacement_start =
+            self.positions.get(range.start).copied().unwrap_or(old_length);
+
         // Compute the new byte length.
         self.len = self.len + replacement.iter().map(SyntaxNode::len).sum::<usize>()
             - superseded.iter().map(SyntaxNode::len).sum::<usize>();
+
+        // Compute the new UTF-16 length and child positions.
+        self.length = self.length + replacement_length - superseded_length;
+        let mut position = replacement_start;
+        let replacement_positions = replacement.iter().map(|child| {
+            let current = position;
+            position += child.length();
+            current
+        });
+        self.positions.splice(range.clone(), replacement_positions);
+        let following = range.start + replacement_range.len();
+        for position in &mut self.positions[following..] {
+            if replacement_length >= superseded_length {
+                *position += replacement_length - superseded_length;
+            } else {
+                *position -= superseded_length - replacement_length;
+            }
+        }
 
         // Compute the new number of descendants.
         self.descendants = self.descendants
@@ -914,6 +941,16 @@ impl InnerNode {
         edits: &mut Option<Edits>,
     ) {
         self.len = self.len + new_len - prev_len;
+        self.length = self.length + new_length - prev_length;
+        let changed_child =
+            *prefix.last().expect("an updated parent must have a changed child");
+        for position in &mut self.positions[changed_child + 1..] {
+            if new_length >= prev_length {
+                *position += new_length - prev_length;
+            } else {
+                *position -= prev_length - new_length;
+            }
+        }
         self.descendants = self.descendants + new_descendants - prev_descendants;
         self.diagnosis = Diagnosis::any(&self.children);
         if let Some(edits) = edits {
