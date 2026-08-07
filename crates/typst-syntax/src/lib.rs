@@ -152,10 +152,29 @@ impl TypstWasmParser {
 
     /// Apply a group of edits whose ranges are all relative to the source
     /// before any of the edits were applied.
-    pub fn edit_many(&mut self, edits: JsValue) {
+    ///
+    /// Returns the union of the ranges that were actually reparsed, as UTF-16
+    /// `[from, to, ...]` pairs in the text after all edits were applied.
+    /// Syntax highlights outside these ranges are unaffected by the edits, so
+    /// the caller only needs to recompute them.
+    pub fn edit_many(&mut self, edits: JsValue) -> Box<[u32]> {
         let edits: Vec<TextEdit> = serde_wasm_bindgen::from_value(edits).unwrap();
-        let mut offset = 0isize;
+        if edits.is_empty() {
+            return Box::new([]);
+        }
 
+        // Total UTF-16 length change of all edits, for mapping the reparsed
+        // ranges of the individual edits into the final text.
+        let total_offset: isize = edits
+            .iter()
+            .map(|edit| {
+                edit.insert.encode_utf16().count() as isize - edit.to as isize
+                    + edit.from as isize
+            })
+            .sum();
+
+        let mut offset = 0isize;
+        let mut ranges = Vec::with_capacity(edits.len() * 2);
         for edit in edits {
             let from = edit.from.checked_add_signed(offset).unwrap();
             let to = edit.to.checked_add_signed(offset).unwrap();
@@ -163,34 +182,88 @@ impl TypstWasmParser {
             let byte_to = self.inner.lines().utf16_to_byte(to).unwrap();
             let replaced_length = to - from;
             let replacement_length = edit.insert.encode_utf16().count();
-            self.inner.edit_with_edits(
+            let range = self.inner.edit_with_edits(
                 byte_from..byte_to,
                 replaced_length,
                 &edit.insert,
                 &mut None,
             );
+
+            // Convert the reparsed byte range (in the text after this edit)
+            // to UTF-16 code units in the final text.
+            let from = self.inner.lines().byte_to_utf16(range.start).unwrap() as isize
+                + total_offset
+                - offset;
+            let to = self.inner.lines().byte_to_utf16(range.end).unwrap() as isize
+                + total_offset
+                - offset;
+            ranges.push(from.max(0) as u32);
+            ranges.push(to.max(0) as u32);
             offset += replacement_length as isize - replaced_length as isize;
         }
+
+        // Merge overlapping ranges.
+        let mut dirty = Vec::with_capacity(ranges.len());
+        let mut from = ranges[0];
+        let mut to = ranges[1];
+        for i in (2..ranges.len()).step_by(2) {
+            if ranges[i] <= to {
+                to = to.max(ranges[i + 1]);
+            } else {
+                dirty.push(from);
+                dirty.push(to);
+                from = ranges[i];
+                to = ranges[i + 1];
+            }
+        }
+        dirty.push(from);
+        dirty.push(to);
+        dirty.into_boxed_slice()
     }
 
-    /// Return syntax highlights as `(from, to, tag)` UTF-16 triples.
+    /// Return syntax highlights as `(from, to, tag)` UTF-16 triples for all
+    /// nodes, in pre-order.
     pub fn highlight(&self) -> Box<[u32]> {
-        fn visit(node: &LinkedNode, offset: usize, output: &mut Vec<u32>) {
+        self.highlight_range(0, self.inner.lines().len_utf16())
+    }
+
+    /// Return syntax highlights as `(from, to, tag)` UTF-16 triples for the
+    /// nodes that overlap the given range. Only the subtrees intersecting the
+    /// range are visited, so this is much cheaper than [`Self::highlight`] for
+    /// a small range within a large document.
+    pub fn highlight_range(&self, from: usize, to: usize) -> Box<[u32]> {
+        fn visit(
+            node: &LinkedNode,
+            offset: usize,
+            from: usize,
+            to: usize,
+            output: &mut Vec<u32>,
+        ) {
+            let node_from = offset;
+            let node_to = offset + node.length();
+            if node_to <= from || to <= node_from {
+                // The node and all its descendants are outside the range.
+                return;
+            }
+
             if let Some(tag) = highlight(node) {
-                output.push(offset as u32);
-                output.push((offset + node.length()) as u32);
+                output.push(node_from as u32);
+                output.push(node_to as u32);
                 output.push(tag as u32);
             }
 
             let mut child_offset = offset;
             for child in node.children() {
-                visit(&child, child_offset, output);
+                visit(&child, child_offset, from, to, output);
                 child_offset += child.length();
             }
         }
 
+        let len = self.inner.lines().len_utf16();
+        let from = from.min(len);
+        let to = to.min(len).max(from);
         let mut output = vec![];
-        visit(&LinkedNode::new(self.inner.root()), 0, &mut output);
+        visit(&LinkedNode::new(self.inner.root()), 0, from, to, &mut output);
         output.into_boxed_slice()
     }
 
